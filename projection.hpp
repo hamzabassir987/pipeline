@@ -50,7 +50,9 @@
 //            ongoing crops harvested every
 //            morning there is something on them; non-ongoing crops harvested
 //            the day they fill up or on the must-harvest day, whichever first.
-//   animals  fed and cared every day, harvested and collected every morning.
+//   animals  fed and cared every day through MACRO_FORCED_FEED_LAST_DAY, then
+//            never again (the must tier stops forcing it), so they escape after
+//            two unfed nights; harvested and collected every morning.
 //   selling  everything on arrival, the morning after harvest; wheat keeps
 //            MACRO_WHEAT_RESERVE for feed, fertilizer keeps what the next
 //            FERT_LOOKAHEAD days' applications need; the last day sells all.
@@ -208,17 +210,24 @@ inline void run_animal(tile t, int day, Stream& s) {
         }
         if (d == LAST) return;
 
-        if (!t.fed_today)   { t.fed_today = 1; s.wheat_need[d] += s.w; s.op(d); }
-        if (!t.cared_today) { t.cared_today = 1; s.op(d); }
+        // Fed and cared while feeding is forced (must_feed's cutoff); after
+        // that the canonical policy stops, and the animal runs unfed until it
+        // escapes.
+        if (d <= MACRO_FORCED_FEED_LAST_DAY) {
+            if (!t.fed_today)   { t.fed_today = 1; s.wheat_need[d] += s.w; s.op(d); }
+            if (!t.cared_today) { t.cared_today = 1; s.op(d); }
+        }
 
-        // ---- the night: daily_refresh_animals, always fed -----------------
-        t.consecutive_unfed = 0;
+        // ---- the night: daily_refresh_animals ------------------------------
+        t.consecutive_unfed = t.fed_today ? 0 : t.consecutive_unfed + 1;
+        if (t.consecutive_unfed >= 2) return;       // escapes; the structure stays
         const int since = (d + 1) - t.phase - a.first_yield_day;
         if (since >= 0 && a.interval > 0 && since % a.interval == 0) {
-            t.yield_units = std::min(a.max_held, t.yield_units + 1 + t.pending_care_bonus);
+            const int bonus = t.fed_today ? t.pending_care_bonus : 0;
+            t.yield_units = std::min(a.max_held, t.yield_units + 1 + bonus);
             t.pending_care_bonus = 0;
         }
-        t.pending_care_bonus += 1;                  // cared and fed tonight
+        if (t.cared_today && t.fed_today) t.pending_care_bonus += 1;
         t.fertilizer_available = 1;
         t.fed_today = t.cared_today = 0;
     }

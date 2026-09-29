@@ -30,7 +30,8 @@
 //                canonical run-off (run_plant / run_animal).
 //
 // Both run the canonical care policy (the must tier's waters, fed and cared
-// every day, the canonical fertilize schedule where it pays), exactly like the
+// every day up to MACRO_FORCED_FEED_LAST_DAY and unfed after it, the canonical
+// fertilize schedule where it pays), exactly like the
 // critic projection, so the two never disagree about what a tile will do.
 //
 // MELON HAS NO BUYER. No town shop consumes it; only the town centre drains
