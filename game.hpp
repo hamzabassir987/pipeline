@@ -948,8 +948,12 @@ inline bool must_harvest(const tile& t, int day, int turn) {
 inline bool must_water(const tile& t, int day) {
     return t.bought && plant_dies_tonight(t, day) && plant_has_future(t, day);
 }
+// After this day a feed is never forced: the feed head decides it like any
+// other feed (an escape this late loses only the last few days of product).
+constexpr int MACRO_FORCED_FEED_LAST_DAY = 25;
 inline bool must_feed(const tile& t, int day) {
     if (!t.bought) return false;
+    if (day > MACRO_FORCED_FEED_LAST_DAY) return false;
     if (animal_escapes_tonight(t, day)) return true;
     // Protect uncashed care bonuses from being wiped out on a production night
     if (t.pending_care_bonus > 0 && animal_produces_tonight(t, day)) return true;
