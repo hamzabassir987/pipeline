@@ -726,7 +726,7 @@ int multinomial(std::vector<policy_move>& policyy) {
 //   9  FEED          drawn. Accepting a feed FORCES a care alongside it
 //                    whenever must_care_after_feed holds. Hires on demand.
 //                    On an animal the FORCED pass fed, the same pair is drawn
-//                    as [No_Care, Care] (H_CARE).
+//                    as [No_Care, Care] by the feed head itself (H_FEED).
 //   9b ESCAPE        forced: an animal still unfed tonight has its units
 //                    harvested, since the escape would take them.
 //   9c COLLECT       drawn per animal with fertilizer waiting (H_COLLECT),
@@ -2636,14 +2636,14 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         const int y = cell / BOARD_SIZE, x = cell % BOARD_SIZE;
         tile& pt = proj.board[y][x];
 
-        // ---- H_CARE: the care on a FORCED feed ---------------------------
+        // ---- the care on a FORCED feed: the FEED HEAD decides it ---------
         // The forced pass fed this animal and left the care open. The feed
-        // pair is drawn again, read as [No_Care, Care], under its own head.
+        // head is drawn again on this cell, its pair read as [No_Care, Care].
         // Drawn here, after planting and fertilizing, so a care never takes
         // an hour a planting wanted -- and hires like any drawn op.
         if (pt.animal >= 0 && pt.fed_today && g[cell].want_fed &&
             !g[cell].want_cared && must_care_after_feed(pt, day)) {
-            if (draw.binary(MACRO_FEED_BASE, cell, H_CARE) != 1) continue;
+            if (draw.binary(MACRO_FEED_BASE, cell, H_FEED) != 1) continue;
             cell_goal trial = g[cell];
             trial.want_cared = 1;
             if (!commit_hiring(cell, trial, 0.0, d.stats.feed_hires)) {

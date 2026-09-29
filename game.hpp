@@ -125,8 +125,8 @@ extern std::ofstream dbg_file;
 // Fertilize, CARE and COLLECT are NOT in this tier: fertilize is the fertilize
 // head's call, collect is the collect head's (H_COLLECT), and care is a choice
 // -- on a DRAWN feed it rides along (the feed head's Feed means feed and care),
-// on a FORCED feed the feed head's pair is drawn again as [No_Care, Care]
-// under H_CARE. An animal left unfed tonight after every pass (a declined feed
+// on a FORCED feed the FEED HEAD itself (H_FEED) is drawn again, its pair
+// read as [No_Care, Care]. An animal left unfed tonight after every pass (a declined feed
 // after the feed cutoff, or no wheat) has its units harvested by the
 // ESCAPE HARVEST at the end of the filter, so they are never lost.
 //
@@ -138,12 +138,13 @@ extern std::ofstream dbg_file;
 //     forced collect is gone. `spatial` 42 -> 44, MACRO_DIM 4359 -> 4559;
 //     load_compatible keeps every old channel and starts the pair leaning to
 //     Collect.
-//   * A CARE HEAD (H_CARE) on FORCED feeds: the feed pair is drawn again as
-//     [No_Care, Care]. A DRAWN feed still brings its care along.
+//   * ON A FORCED FEED THE FEED HEAD DECIDES THE CARE: H_FEED is drawn again
+//     on that cell, its pair read as [No_Care, Care]. A DRAWN feed still
+//     brings its care along.
 //   * An animal's harvest is forced only if it goes unfed tonight.
 //   * A full, ripe non-ongoing crop gets no life-support water: it has no
 //     future (plant_has_future), so it is harvested instead.
-//   * NUM_HEADS 15 -> 17: entropy_file takes `collect` and `care` lines.
+//   * NUM_HEADS 15 -> 16: entropy_file takes a `collect` line.
 //
 // ---------------------------------------------------------------------------
 // EARLIER  --  no hire head, a richer sell-time head
@@ -846,8 +847,8 @@ inline bool care_banks_tonight(const tile& t, int day) {
 
 // Given that this animal IS being fed today, a care would bank a bonus. Not a
 // must any more: on a DRAWN feed the care rides along with the Feed choice; on
-// a FORCED feed it is the H_CARE draw (the feed pair, read as [No_Care,
-// Care]). Either way this is the mask: it says a care here is possible.
+// a FORCED feed it is the feed head's draw (H_FEED, its pair read as
+// [No_Care, Care]). Either way this is the mask: it says a care here is possible.
 inline bool must_care_after_feed(const tile& t, int day) {
     (void)day;
     return t.animal >= 0 && !t.cared_today;
@@ -1037,8 +1038,8 @@ constexpr bool MACRO_FORCE_PREWATER_ON_MUST_HARVEST = true;
 // water, but it does get a YIELD water, ahead of the harvest, whenever
 // water_yields_now says the window is open.
 //
-// `care` and `collect` are never set by cell_musts any more (H_CARE and
-// H_COLLECT decide them); the fields stay so the forced pass reads the same.
+// `care` and `collect` are never set by cell_musts any more (the feed head
+// and H_COLLECT decide them); the fields stay so the forced pass reads the same.
 // There is no `fertilize`: spending a fertilizer is the fertilize head's call.
 //
 // AN ANIMAL'S HARVEST IS FORCED ONLY WHEN IT GOES UNFED. must_harvest fires on
@@ -1614,7 +1615,7 @@ constexpr int MACRO_WHEAT_RESERVE = 0;
 // (plant_type_1 .. plant_type_4); a bare `plant_type` line still sets all four.
 //
 // WHICH MODEL A HEAD READS is head_is_global(), not an index threshold: the
-// sell-time, collect and care heads are PER-CELL heads appended after the
+// sell-time and collect heads are PER-CELL heads appended after the
 // global ones.
 enum HeadId {
     H_HARVEST = 0,     // the per-type [None, Keep, Sell] triples, pooled
@@ -1635,9 +1636,6 @@ enum HeadId {
                        // or NO_HARVEST / KEEP
     H_COLLECT,         // per cell: [No_Collect, Collect] on an animal with
                        // fertilizer waiting (the collect pair)
-    H_CARE,            // per cell: [No_Care, Care] on a FORCED feed. Reads the
-                       // FEED pair's channels: same logits, its own head id,
-                       // so its entropy is targeted apart from the feed's
     NUM_HEADS
 };
 

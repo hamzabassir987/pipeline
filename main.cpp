@@ -174,8 +174,8 @@ struct Experience {
 // out (it keeps whatever it held last iteration), '#' starts a comment, and an
 // unrecognised name is reported rather than absorbed.
 //
-// `collect` is the per-cell collect head, and `care` the care draw on a FORCED
-// feed (it reads the feed pair's logits, but has its own entropy target).
+// `collect` is the per-cell collect head. There is no care line: on a FORCED
+// feed the care is the feed head's own draw, so `feed` covers it.
 //
 // THE FOUR TYPE SLOTS each have their own line now, plant_type_1 .. _4 (slot 1
 // is drawn most, slot 4 least). A bare `plant_type` line -- what older files
@@ -187,9 +187,9 @@ static const char* HEAD_NAMES[NUM_HEADS] = {
     "harvest", "water", "primary", "fertilize", "feed",
     "land", "hire", "sell", "plant_n", "place_n",
     "plant_type_1", "plant_type_2", "plant_type_3", "plant_type_4",
-    "sell_time", "collect", "care"
+    "sell_time", "collect"
 };
-static_assert(H_CARE == 16 && NUM_HEADS == 17, "HEAD_NAMES is out of step with HeadId");
+static_assert(H_COLLECT == 15 && NUM_HEADS == 16, "HEAD_NAMES is out of step with HeadId");
 
 // ===========================================================================
 // LOG FORMATTING
@@ -986,7 +986,7 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
     // must_dropped should be at or near zero. It now also counts cares shed
     // to make a feed fit, which is the first thing to go when hands run out.
     //
-    // cared counts both the care that rides on a drawn feed and the H_CARE
+    // cared counts both the care that rides on a drawn feed and the feed head's
     // draws on forced feeds; collected is the collect head's.
     // Plan figures are per game, from the LAST decision day's plan.
     std::cout << "\n  EVAL vs frozen  wins " << lfmt::ratio(w, G)
