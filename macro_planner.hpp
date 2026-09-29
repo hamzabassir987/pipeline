@@ -1381,11 +1381,15 @@ struct MacroStats {
     // ---- the derived ops ----
     int fertilized = 0;
     int cared = 0;
+    int collected = 0;       // the collect head's accepted collects
+    int escape_harvests = 0; // animals left unfed tonight, harvested so the
+                             // units are not lost with the escape
     // ---- hires, by the pass that made them (there is no hire head) ----
     int must_hires = 0;      // the forced pass
     int plant_hires = 0;     // a drawn planting
     int fert_hires = 0;      // an accepted fertilize
-    int feed_hires = 0;      // an accepted feed
+    int feed_hires = 0;      // an accepted feed (or care on a forced feed)
+    int collect_hires = 0;   // an accepted collect, or an escape harvest
     int broken_routes = 0;   // routes that do not run at flatten time (must stay 0)
 
     // ---- the melon mask ----

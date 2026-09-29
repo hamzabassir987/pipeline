@@ -114,18 +114,39 @@ extern std::ofstream dbg_file;
 // log-prob, no entropy -- and masks the surviving heads off exactly those
 // cells. See CellMust / cell_musts below.
 //
-//   harvest    ripe and gone by morning
+//   harvest    ripe and gone by morning -- on an animal only when NO feed is
+//              placed for it (a fed animal keeps its units; see below)
 //   water      life support on a plant with a future, or the yield water, or
-//              banking a fertilizer
+//              banking a fertilizer. A FULL, ripe non-ongoing crop has no
+//              future (plant_has_future): it is harvested, not kept alive.
 //   feed       the animal escapes tonight, or a care bonus would be wiped
-//   care       rides on every feed, unconditionally
-//   collect    any animal with fertilizer waiting: one hour for ~100 coins
 //   prewater   a wiping harvest is watered first when the window is open
 //
-// Fertilize is NOT in this tier any more: it is the fertilize head's call.
+// Fertilize, CARE and COLLECT are NOT in this tier: fertilize is the fertilize
+// head's call, collect is the collect head's (H_COLLECT), and care is a choice
+// -- on a DRAWN feed it rides along (the feed head's Feed means feed and care),
+// on a FORCED feed the feed head's pair is drawn again as [No_Care, Care]
+// under H_CARE. An animal left unfed tonight after every pass (a declined feed
+// after the feed cutoff, or no wheat) has its units harvested by the
+// ESCAPE HARVEST at the end of the filter, so they are never lost.
 //
 // ---------------------------------------------------------------------------
-// BREAKING CHANGES IN THIS REVISION  --  no hire head, a richer sell-time head
+// BREAKING CHANGES IN THIS REVISION  --  collect and care are choices
+// ---------------------------------------------------------------------------
+//   * A COLLECT HEAD (H_COLLECT): a per-cell [No_Collect, Collect] pair on
+//     every animal with fertilizer waiting, drawn after the feed pass. The
+//     forced collect is gone. `spatial` 42 -> 44, MACRO_DIM 4359 -> 4559;
+//     load_compatible keeps every old channel and starts the pair leaning to
+//     Collect.
+//   * A CARE HEAD (H_CARE) on FORCED feeds: the feed pair is drawn again as
+//     [No_Care, Care]. A DRAWN feed still brings its care along.
+//   * An animal's harvest is forced only if it goes unfed tonight.
+//   * A full, ripe non-ongoing crop gets no life-support water: it has no
+//     future (plant_has_future), so it is harvested instead.
+//   * NUM_HEADS 15 -> 17: entropy_file takes `collect` and `care` lines.
+//
+// ---------------------------------------------------------------------------
+// EARLIER  --  no hire head, a richer sell-time head
 // ---------------------------------------------------------------------------
 //   * THE HIRE HEAD IS GONE. Only hand 0 survives the night, so every day
 //     starts with one hand and EVERY other hand is hired on demand by the
@@ -747,11 +768,20 @@ inline bool animal_escapes_tonight(const tile& t, int day) {
 //
 // The last day is the same statement about the clock: nothing happens after the
 // night of day NUM_DAYS-1, so surviving it buys nothing.
+//
+// A FULL non-ongoing crop that is already RIPE cannot gain a unit either: its
+// water adds nothing (yield_units is capped at max_yield), and one hour spent
+// harvesting it banks the same units the life-support water would only keep
+// standing. So it has no future: must_water leaves it alone, and if it would
+// die tonight it is a forced harvest instead (yield_lost_tonight). A full crop
+// that is NOT yet ripe (a fertilized melon, say) still needs keeping alive.
 inline bool plant_has_future(const tile& t, int day) {
     if (t.type != T_PLANT || t.crop < 0 || t.crop >= NUM_CROPS) return false;
     if (day + 1 > NUM_DAYS - 1) return false;        // no tomorrow to gain in
     const CropDef& cd = CROPS[t.crop];
     if (cd.ongoing) return t.max_lifespan_step < 0;
+    if (t.yield_units >= cd.max_yield && day - t.phase >= cd.first_yield_day)
+        return false;                                // full and ripe
     return day < t.phase + cd.max_yield_day;
 }
 
@@ -814,9 +844,10 @@ inline bool care_banks_tonight(const tile& t, int day) {
     return t.animal >= 0 && t.fed_today && t.cared_today;
 }
 
-// Given that this animal IS being fed today, the care is forced as well.
-// Unconditional: the hand is already on the cell and the feed supplies the
-// fed night the bonus banks on. No head, no draw.
+// Given that this animal IS being fed today, a care would bank a bonus. Not a
+// must any more: on a DRAWN feed the care rides along with the Feed choice; on
+// a FORCED feed it is the H_CARE draw (the feed pair, read as [No_Care,
+// Care]). Either way this is the mask: it says a care here is possible.
 inline bool must_care_after_feed(const tile& t, int day) {
     (void)day;
     return t.animal >= 0 && !t.cared_today;
@@ -960,7 +991,9 @@ inline bool must_feed(const tile& t, int day) {
     return false;
 }
 
-// Fertilizer is waiting on a stocked structure. Always worth the hour.
+// Fertilizer is waiting on a stocked structure. Not a must any more: this is
+// the collect head's (H_COLLECT) mask. Fertilizer has no town demand at all,
+// so whether one more is worth an hour and a night shed slot is a real call.
 inline bool must_collect(const tile& t) {
     return t.bought && t.animal >= 0 && t.fertilizer_available != 0;
 }
@@ -1004,8 +1037,18 @@ constexpr bool MACRO_FORCE_PREWATER_ON_MUST_HARVEST = true;
 // water, but it does get a YIELD water, ahead of the harvest, whenever
 // water_yields_now says the window is open.
 //
-// `care` is only ever set together with `feed`. `collect` is independent.
+// `care` and `collect` are never set by cell_musts any more (H_CARE and
+// H_COLLECT decide them); the fields stay so the forced pass reads the same.
 // There is no `fertilize`: spending a fertilizer is the fertilize head's call.
+//
+// AN ANIMAL'S HARVEST IS FORCED ONLY WHEN IT GOES UNFED. must_harvest fires on
+// an animal that escapes tonight, and so does must_feed -- but the feed alone
+// stops the escape, and a fed animal KEEPS what it holds (and its care bonus),
+// so harvesting it too was an hour the harvest head should have decided. So
+// cell_musts never forces an animal's harvest. If the forced pass drops a
+// forced feed (no wheat) it puts the harvest back; after the feed cutoff the
+// feed head decides, and the ESCAPE HARVEST (pass 9b, after the feed pass)
+// banks the units of any animal that is still unfed.
 struct CellMust {
     bool harvest = false, water = false, feed = false, prewater = false;
     bool care = false, collect = false;
@@ -1033,8 +1076,10 @@ inline CellMust cell_musts(const tile& t, int day, int turn) {
         m.water = must_water(t, day) || must_yield_water(t, day)
                || must_bank_water(t, day);
         m.feed  = must_feed(t, day);
-        m.care  = m.feed && must_care_after_feed(t, day);
-        m.collect = must_collect(t);
+        // An animal's harvest is never forced HERE: whether it escapes is not
+        // known until the feed is settled (forced up to the feed cutoff, the
+        // feed head's call after it). See the banner above CellMust.
+        if (t.animal >= 0) m.harvest = false;
     } else if (MACRO_FORCE_PREWATER_ON_MUST_HARVEST && water_yields_now(t, day)) {
         m.prewater = true;
     }
@@ -1338,18 +1383,28 @@ inline bool harvest_type_has_sell_time(int htype) {
 }
 
 constexpr int MACRO_FERT_CH      = 2;    // [No_Fert, Fert]
-constexpr int MACRO_FEED_CH      = 2;    // [No_Feed, Feed]
+constexpr int MACRO_FEED_CH      = 2;    // [No_Feed, Feed]; on a FORCED feed,
+                                         // the same pair is [No_Care, Care]
+constexpr int MACRO_COLLECT_CH   = 2;    // [No_Collect, Collect]
 
 // No primary channels: WHAT gets planted / placed is decided by the COUNT
 // heads (global), and WHERE by a fixed distance rule in the filter.
+//
+// THE COLLECT PAIR IS APPENDED after the feed pair (spatial 42 -> 44,
+// MACRO_DIM 4359 -> 4559). Every global head's BASE moved by 200, but the
+// global heads are their own Linear layers, so their weights are untouched;
+// load_compatible copies the 42 old spatial channels in place and starts the
+// collect pair leaning to Collect, which is what the forced rule did.
 constexpr int MACRO_SPATIAL_CH   = MACRO_HARVEST_CH + MACRO_SELL_TIME_CH
-                                 + MACRO_FERT_CH + MACRO_FEED_CH;     // 42
+                                 + MACRO_FERT_CH + MACRO_FEED_CH
+                                 + MACRO_COLLECT_CH;                  // 44
 
 constexpr int MACRO_HARVEST_BASE   = 0;
 constexpr int MACRO_SELL_TIME_BASE = MACRO_HARVEST_BASE   + MACRO_HARVEST_CH   * CELLS;  // 2400
 constexpr int MACRO_FERT_BASE      = MACRO_SELL_TIME_BASE + MACRO_SELL_TIME_CH * CELLS;  // 3800
 constexpr int MACRO_FEED_BASE      = MACRO_FERT_BASE      + MACRO_FERT_CH      * CELLS;  // 4000
-constexpr int MACRO_LAND_BASE      = MACRO_FEED_BASE      + MACRO_FEED_CH      * CELLS;  // 4200
+constexpr int MACRO_COLLECT_BASE   = MACRO_FEED_BASE      + MACRO_FEED_CH      * CELLS;  // 4200
+constexpr int MACRO_LAND_BASE      = MACRO_COLLECT_BASE   + MACRO_COLLECT_CH   * CELLS;  // 4400
 
 // NO HIRE HEAD. Hands are hired on demand by the passes (see the filter).
 
@@ -1364,7 +1419,7 @@ constexpr int MACRO_SELL_BINS = 4;
 inline int macro_wheat_keep_days(int bin) {       // bins 1..3 only
     return bin == 1 ? 3 : bin == 2 ? 2 : 1;
 }
-constexpr int MACRO_SELL_BASE = MACRO_LAND_BASE + 2;                    // 4202
+constexpr int MACRO_SELL_BASE = MACRO_LAND_BASE + 2;                    // 4402
 
 // ---- COUNT, one head per plantable / placeable type -----------------------
 // HOW MANY of each type to put down today. The bins are HALVED past 2: bin b
@@ -1394,7 +1449,7 @@ constexpr int macro_count_bins(int type) {
 }
 constexpr int MACRO_COUNT_WIDTH = NUM_CROPS   * MACRO_PLANT_BINS
                                 + NUM_ANIMALS * MACRO_PLACE_BINS;       // 85
-constexpr int MACRO_COUNT_BASE  = MACRO_SELL_BASE + NUM_PRODUCTS * MACRO_SELL_BINS;  // 4238
+constexpr int MACRO_COUNT_BASE  = MACRO_SELL_BASE + NUM_PRODUCTS * MACRO_SELL_BINS;  // 4438
 static_assert(macro_count_value(MACRO_PLANT_BINS - 1) == MACRO_PLANT_MAX, "plant bins");
 static_assert(macro_count_value(MACRO_PLACE_BINS - 1) == MACRO_PLACE_MAX, "place bins");
 
@@ -1440,11 +1495,11 @@ constexpr int  MACRO_DAY0_FORCED_N = (int)(sizeof(MACRO_DAY0_FORCED) / sizeof(MA
 constexpr bool MACRO_DAY0_FORCED_CLOSES_SLOTS = true;
 constexpr int MACRO_TYPE_NONE   = 0;                                    // bin 0
 constexpr int MACRO_TYPE_BINS   = NUM_COUNT_TYPES + 1;                  // 9
-constexpr int MACRO_TYPE_BASE   = MACRO_COUNT_BASE + MACRO_COUNT_WIDTH; // 4323
+constexpr int MACRO_TYPE_BASE   = MACRO_COUNT_BASE + MACRO_COUNT_WIDTH; // 4523
 constexpr int MACRO_TYPE_WIDTH  = MACRO_TYPE_SLOTS * MACRO_TYPE_BINS;   // 36
-constexpr int MACRO_DIM         = MACRO_TYPE_BASE + MACRO_TYPE_WIDTH;   // 4359
+constexpr int MACRO_DIM         = MACRO_TYPE_BASE + MACRO_TYPE_WIDTH;   // 4559
 
-static_assert(MACRO_DIM == 4359, "macro output width");
+static_assert(MACRO_DIM == 4559, "macro output width");
 static_assert(MACRO_HARVEST_TYPES == NUM_COUNT_TYPES,
               "harvest pairs and count ceilings index the same type space");
 
@@ -1559,7 +1614,8 @@ constexpr int MACRO_WHEAT_RESERVE = 0;
 // (plant_type_1 .. plant_type_4); a bare `plant_type` line still sets all four.
 //
 // WHICH MODEL A HEAD READS is head_is_global(), not an index threshold: the
-// sell-time head is a PER-CELL head appended after the global ones.
+// sell-time, collect and care heads are PER-CELL heads appended after the
+// global ones.
 enum HeadId {
     H_HARVEST = 0,     // the per-type [None, Keep, Sell] triples, pooled
     H_WATER,           // DEAD
@@ -1577,6 +1633,11 @@ enum HeadId {
     H_PLANT_TYPE_3,    // type slot 4 (drawn least)
     H_SELL_TIME,       // per cell: the hour an HB_SELL harvest is sold at,
                        // or NO_HARVEST / KEEP
+    H_COLLECT,         // per cell: [No_Collect, Collect] on an animal with
+                       // fertilizer waiting (the collect pair)
+    H_CARE,            // per cell: [No_Care, Care] on a FORCED feed. Reads the
+                       // FEED pair's channels: same logits, its own head id,
+                       // so its entropy is targeted apart from the feed's
     NUM_HEADS
 };
 

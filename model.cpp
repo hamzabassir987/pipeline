@@ -690,15 +690,14 @@ int multinomial(std::vector<policy_move>& policyy) {
 // THE ORDER:
 //
 //   0  SELL          proceeds fund everything
-//   1  MUST SET      built off the live board: the forced harvests, the three
-//                    kinds of forced water, the feeds with their cares, and
-//                    every fertilizer collect
+//   1  MUST SET      built off the live board: the forced harvests (an
+//                    animal's only when it goes unfed), the three kinds of
+//                    forced water, and the forced feeds. No care, no collect.
 //   5  LAND
 //   2b ORDER HOURS   fixed here, after land
-//   6  FORCED PASS   reserved before any head draws. Hires on demand. Shed
-//                    order when the hours or the goods run out: care,
-//                    collect, then the feed and the harvest, which protect
-//                    the cell itself.
+//   6  FORCED PASS   reserved before any head draws. Hires on demand. When
+//                    the goods run out a feed is dropped, and its animal's
+//                    harvest put back (it escapes tonight).
 //   7  HARVEST       every harvestable cell, in order of standing value,
 //                    draws the cell's OWN TYPE's [None, Keep, Sell] triple
 //                    (a forced one draws [Keep, Sell]: HOW it is banked).
@@ -726,6 +725,12 @@ int multinomial(std::vector<policy_move>& policyy) {
 //                    Hires on demand.
 //   9  FEED          drawn. Accepting a feed FORCES a care alongside it
 //                    whenever must_care_after_feed holds. Hires on demand.
+//                    On an animal the FORCED pass fed, the same pair is drawn
+//                    as [No_Care, Care] (H_CARE).
+//   9b ESCAPE        forced: an animal still unfed tonight has its units
+//                    harvested, since the escape would take them.
+//   9c COLLECT       drawn per animal with fertilizer waiting (H_COLLECT),
+//                    while the night shed has a slot. Hires on demand.
 //  10  DROPS         the deferred Sell harvests become mid-day drops in the
 //                    hours left, hiring on demand. A sale that no longer fits
 //                    REMASKS its hours on the plan as it stands and redraws
@@ -1548,6 +1553,13 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             if (m.care) {                     // and no fed night to care on
                 m.care = false;
                 ++d.stats.must_dropped;
+            }
+            // cell_musts dropped this animal's harvest BECAUSE it was being
+            // fed. Unfed, it escapes tonight: bank what it holds.
+            if (lt.animal >= 0 && animal_escapes_tonight(lt, day) &&
+                harvest_ready(lt, day) && !m.harvest) {
+                m.harvest = true;
+                ++d.stats.must_ops;
             }
         }
         // A collect into a shed already full at nightfall is refused.
@@ -2624,6 +2636,25 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         const int y = cell / BOARD_SIZE, x = cell % BOARD_SIZE;
         tile& pt = proj.board[y][x];
 
+        // ---- H_CARE: the care on a FORCED feed ---------------------------
+        // The forced pass fed this animal and left the care open. The feed
+        // pair is drawn again, read as [No_Care, Care], under its own head.
+        // Drawn here, after planting and fertilizing, so a care never takes
+        // an hour a planting wanted -- and hires like any drawn op.
+        if (pt.animal >= 0 && pt.fed_today && g[cell].want_fed &&
+            !g[cell].want_cared && must_care_after_feed(pt, day)) {
+            if (draw.binary(MACRO_FEED_BASE, cell, H_CARE) != 1) continue;
+            cell_goal trial = g[cell];
+            trial.want_cared = 1;
+            if (!commit_hiring(cell, trial, 0.0, d.stats.feed_hires)) {
+                draw.retract(); ++d.stats.rej_capacity; continue;
+            }
+            pt.cared_today = 1;
+            ++d.stats.cared;
+            tmr_dirty = true;
+            continue;
+        }
+
         if (pt.animal < 0 || pt.fed_today) { ++d.stats.rej_illegal; continue; }
         if (!goal_is_animal(g[cell]))      { ++d.stats.rej_illegal; continue; }
         // An OPTIONAL feed spends wheat in the shed or spare money. It may
@@ -2674,6 +2705,57 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             ++d.stats.must_ops;
             ++d.stats.must_placed;
         }
+    }
+
+    // =====================================================================
+    // 9b. ESCAPE HARVEST  --  forced, no draw
+    // =====================================================================
+    // An animal that is still unfed tonight after every pass (the feed head
+    // declined it after the feed cutoff, or there was no wheat) escapes, and
+    // the units it holds go with it. cell_musts no longer forces an animal's
+    // harvest on its own, so bank them here, kept for the nightly sweep. A
+    // cell the harvest pass already emptied reads 0 units on `proj`.
+    for (int cell = 0; cell < CELLS; ++cell) {
+        tile& pt = proj.board[cell / BOARD_SIZE][cell % BOARD_SIZE];
+        if (pt.animal < 0 || pt.yield_units <= 0 || !pt.bought) continue;
+        if (!animal_escapes_tonight(pt, day) || g[cell].want_harvest) continue;
+        if (!goal_is_animal(g[cell])) continue;
+        const int units = pt.yield_units;
+        cell_goal trial = harvest_goal(cell, /*in_place=*/true, false);
+        if (!commit_hiring(cell, trial, 0.0, d.stats.collect_hires)) {
+            ++d.stats.must_dropped;
+            continue;
+        }
+        night += units;
+        pt.yield_units = 0;
+        ++d.stats.harvest_keep;
+        ++d.stats.escape_harvests;
+        tmr_dirty = true;
+    }
+
+    // =====================================================================
+    // 9c. COLLECT  (drawn)  --  [No_Collect, Collect]
+    // =====================================================================
+    // Every animal with fertilizer waiting draws the collect pair, once the
+    // harvests, plantings and feeds have taken the hours and the shed. The
+    // unit is kept for the nightly sweep, so it needs a night slot: a full
+    // night is not offered. Accepting one hires to fit, like every drawn op.
+    for (int cell = 0; cell < CELLS; ++cell) {
+        tile& pt = proj.board[cell / BOARD_SIZE][cell % BOARD_SIZE];
+        if (!must_collect(pt))              continue;
+        if (!goal_is_animal(g[cell]))       { ++d.stats.rej_illegal; continue; }
+        if (night >= SHED_CAPACITY)         { ++d.stats.rej_budget;  continue; }
+        if (draw.binary(MACRO_COLLECT_BASE, cell, H_COLLECT) != 1) continue;
+        cell_goal trial = g[cell];
+        trial.in_denominator = 1;
+        trial.want_collect_fertilizer = 1;
+        if (!commit_hiring(cell, trial, 0.0, d.stats.collect_hires)) {
+            draw.retract(); ++d.stats.rej_capacity; continue;
+        }
+        pt.fertilizer_available = 0;
+        ++night;
+        collect_cells.push_back(cell);
+        ++d.stats.collected;
     }
 
     // =====================================================================

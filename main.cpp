@@ -174,9 +174,8 @@ struct Experience {
 // out (it keeps whatever it held last iteration), '#' starts a comment, and an
 // unrecognised name is reported rather than absorbed.
 //
-// NOTE the care and collect heads are gone -- both are forced now -- so an
-// older file that still names them reports them as unknown fields and every other
-// value still lands where it is named.
+// `collect` is the per-cell collect head, and `care` the care draw on a FORCED
+// feed (it reads the feed pair's logits, but has its own entropy target).
 //
 // THE FOUR TYPE SLOTS each have their own line now, plant_type_1 .. _4 (slot 1
 // is drawn most, slot 4 least). A bare `plant_type` line -- what older files
@@ -188,8 +187,9 @@ static const char* HEAD_NAMES[NUM_HEADS] = {
     "harvest", "water", "primary", "fertilize", "feed",
     "land", "hire", "sell", "plant_n", "place_n",
     "plant_type_1", "plant_type_2", "plant_type_3", "plant_type_4",
-    "sell_time"
+    "sell_time", "collect", "care"
 };
+static_assert(H_CARE == 16 && NUM_HEADS == 17, "HEAD_NAMES is out of step with HeadId");
 
 // ===========================================================================
 // LOG FORMATTING
@@ -294,20 +294,35 @@ static void read_entropy_file(const char* path,
 //     features were APPENDED to the policy scalars, so the old columns are
 //     copied in place and the new ones start at ZERO -- the bodies compute
 //     exactly what they did until the new inputs earn a weight.
+// (c) `spatial` 42 -> 44 output channels: the collect pair was APPENDED after
+//     the feed pair, so every old channel stays where it is. The new pair
+//     starts at zero weight with bias [0, COLLECT_PRIOR_LOGIT], i.e. collecting
+//     about 88% of the time -- close to the forced collect it replaces, so a
+//     loaded policy does not suddenly stop collecting. A 40-channel checkpoint
+//     goes through (a) and then (c).
 // Returns true if `dst` was filled from `src`.
 static bool remap_known(const std::string& name, const torch::Tensor& src, torch::Tensor dst) {
-    constexpr int OLD_SPATIAL = 40;
+    constexpr int OLD_SPATIAL_A = 40;           // before the sell-time fallbacks
+    constexpr int OLD_SPATIAL_C = 42;           // before the collect pair
     constexpr int OLD_SELL_TIME = 12;
     constexpr int OLD_POLICY_SCALARS = 272;
+    constexpr float COLLECT_PRIOR_LOGIT = 2.0f;
+    const int collect_ch = MACRO_SPATIAL_CH - MACRO_COLLECT_CH;        // 42
     if ((name == "spatial.weight" || name == "spatial.bias") &&
-        src.size(0) == OLD_SPATIAL && dst.size(0) == MACRO_SPATIAL_CH &&
+        (src.size(0) == OLD_SPATIAL_A || src.size(0) == OLD_SPATIAL_C) &&
+        dst.size(0) == MACRO_SPATIAL_CH &&
         src.dim() == dst.dim() && (src.dim() == 1 || src.sizes().slice(1).equals(dst.sizes().slice(1)))) {
-        const int old_sell_end = MACRO_HARVEST_CH + OLD_SELL_TIME;          // 36
-        const int new_sell_end = MACRO_HARVEST_CH + MACRO_SELL_TIME_CH;     // 38
         dst.zero_();
-        dst.slice(0, 0, old_sell_end).copy_(src.slice(0, 0, old_sell_end));
-        dst.slice(0, new_sell_end, MACRO_SPATIAL_CH)
-           .copy_(src.slice(0, old_sell_end, OLD_SPATIAL));
+        if (src.size(0) == OLD_SPATIAL_A) {
+            const int old_sell_end = MACRO_HARVEST_CH + OLD_SELL_TIME;      // 36
+            const int new_sell_end = MACRO_HARVEST_CH + MACRO_SELL_TIME_CH; // 38
+            dst.slice(0, 0, old_sell_end).copy_(src.slice(0, 0, old_sell_end));
+            dst.slice(0, new_sell_end, collect_ch)
+               .copy_(src.slice(0, old_sell_end, OLD_SPATIAL_A));
+        } else {
+            dst.slice(0, 0, collect_ch).copy_(src);
+        }
+        if (dst.dim() == 1) dst[collect_ch + 1].fill_(COLLECT_PRIOR_LOGIT);
         return true;
     }
     if ((name == "global_critic.in_fc.weight" || name == "global_critic.value_in_fc.weight") &&
@@ -931,7 +946,7 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
     double musts = 0.0, mdrop = 0.0, crew = 0.0;
     double h_must = 0.0, h_harv = 0.0, h_plant = 0.0, h_fert = 0.0, h_feed = 0.0;
     double s_sell = 0.0, s_keep = 0.0, s_skip = 0.0, s_redraw = 0.0, s_fall = 0.0;
-    double fert = 0.0, care = 0.0;
+    double fert = 0.0, care = 0.0, coll = 0.0, esc = 0.0, h_coll = 0.0;
     double liq_crew = 0.0, liq_cells = 0.0, liq_left = 0.0;
     long dropped = 0;
     for (int i = 0; i < G; ++i) {
@@ -954,6 +969,9 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
         s_fall   += last_stats[i].sell_fallback;
         fert   += last_stats[i].fertilized;
         care   += last_stats[i].cared;
+        coll   += last_stats[i].collected;
+        esc    += last_stats[i].escape_harvests;
+        h_coll += last_stats[i].collect_hires;
         // The liquidation: how big a crew it needed and what it could not
         // reach in time. liq_left should be at or near zero -- anything else
         // is money left standing on the board on the last night.
@@ -968,8 +986,8 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
     // must_dropped should be at or near zero. It now also counts cares shed
     // to make a feed fit, which is the first thing to go when hands run out.
     //
-    // care/day is no longer a head's output: it is the forced care that rides
-    // on every feed, so it tracks feeds on animals not already cared for.
+    // cared counts both the care that rides on a drawn feed and the H_CARE
+    // draws on forced feeds; collected is the collect head's.
     // Plan figures are per game, from the LAST decision day's plan.
     std::cout << "\n  EVAL vs frozen  wins " << lfmt::ratio(w, G)
               << "   losses " << l << "   draws " << dr
@@ -981,12 +999,15 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
               << " (dropped " << std::setprecision(2) << (mdrop / G) << std::setprecision(1) << ")"
               << "   crew " << (crew / G)
               << "   fertilized " << (fert / G)
-              << "   cared " << (care / G) << "\n"
+              << "   cared " << (care / G)
+              << "   collected " << (coll / G)
+              << "   escape harvests " << (esc / G) << "\n"
               << "    hires by pass   must " << (h_must / G)
               << "   harvest+drop " << (h_harv / G)
               << "   plant " << (h_plant / G)
               << "   fert " << (h_fert / G)
-              << "   feed " << (h_feed / G) << "\n"
+              << "   feed+care " << (h_feed / G)
+              << "   collect " << (h_coll / G) << "\n"
               << "    sell-time       sold " << (s_sell / G)
               << "   keep " << (s_keep / G)
               << "   no-harvest " << (s_skip / G)
