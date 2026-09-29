@@ -423,6 +423,25 @@ public:
         return ss_plan_ + picks + 2 * dshed_[cell] + (int)t.ops.size();
     }
 
+    // ---- MIDDAY LAND: a bigger map mid-plan ----------------------------
+    // Land bought by a timed order joins the walkable map. Hands may walk any
+    // tile at any hour (the map only prunes where there is nothing to do), so
+    // the wider geometry is valid for the whole day; ops on the new land wait
+    // for the purchase through their tasks' release hour. Distances only
+    // shrink, so every route is re-priced (and re-ordered if its lazy drops no
+    // longer run).
+    void widen(int n_unlocked) {
+        geo_  = &macro_geo(n_unlocked);
+        dist_ = geo_->dist.data();
+        dshed_.assign(CELLS, INF);
+        for (int c = 0; c < CELLS; ++c)
+            for (const int a : access_) dshed_[c] = std::min(dshed_[c], geo_->D(c, a));
+        for (Route& r : routes_)
+            if (!r.seq.empty()) refresh(r);
+        script_.clear();
+        settled_ = false;
+    }
+
     // ---- growing the crew mid-plan -------------------------------------
     bool add_hand(const ipos& p) {
         if ((int)routes_.size() >= MAX_UNITS) return false;
@@ -1450,6 +1469,7 @@ struct MacroStats {
     int rej_capacity = 0;
     int hired = 0;
     bool bought_land = false;
+    bool bought_land_mid = false;   // bought by a timed order (midday planning)
     double spent = 0.0;
     double raised = 0.0;
 

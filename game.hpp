@@ -1619,8 +1619,13 @@ constexpr int MACRO_WHEAT_RESERVE = 0;
 //   ORDERS     every timed entry is counted per hour, sells ahead of buys, and
 //              a late buy only goes to an hour with a free market slot.
 //
-// Land and hires stay on hour-0 money: a hire must exist before its route, and
-// land bought mid-day would have the hands cross unowned ground before it.
+//   LAND       if pass 5 could not afford land at hour 0, it is offered once
+//              more (the same H_LAND pair), paid with the hour-0 money left plus
+//              the income line: a timed BUY_LAND, every task on the new quadrant
+//              released the hour after. Hands may walk any tile at any hour, so
+//              the planner simply widens its map.
+//
+// Hires stay on hour-0 money: a hand must exist before its route starts.
 constexpr int    MIDDAY_LAST_DAY       = 10;
 constexpr double MIDDAY_INCOME_HAIRCUT = 0.8;
 inline bool midday_planning(int day) { return day <= MIDDAY_LAST_DAY; }

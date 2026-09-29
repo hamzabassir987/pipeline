@@ -2339,6 +2339,15 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
     };
     if (midday) collect_pass();
 
+    // ---- MIDDAY LAND ----------------------------------------------------
+    // Pass 5 only offers land the hour-0 money covers. On a midday-planning
+    // day that did not buy it, land is offered ONCE more here, paid with the
+    // hour-0 money left plus the income line: a timed BUY_LAND at the earliest
+    // hour that covers the rest, every task on the new quadrant released the
+    // hour after (land_rel). The same H_LAND pair is drawn; at most one land
+    // draw a day, since pass 5 did not draw.
+    int land_rel = -1, land_q = -1;
+    constexpr int LAND_KEY = NUM_ITEMS;              // its market entry in late_buys
     // =====================================================================
     // 8. PLANTING  --  a count per type, placed by distance to the shed
     // =====================================================================
@@ -2457,6 +2466,9 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         trial.in_denominator = 1;
         trial.release_hour  = late ? late_hour + 1 : -1;
         trial.late_occupant = (late && anim >= 0) ? 1 : 0;
+        // On land bought mid-day, nothing happens before it is owned.
+        if (land_rel >= 0 && quadrant_of(x, y) == land_q)
+            trial.release_hour = std::max(trial.release_hour, land_rel);
         // HARVEST, DIG, PLANT: the standing units are banked BEFORE the dig.
         // Left as want_harvest the op would be ordered after the new occupant
         // and land on an empty plant or a fresh animal.
@@ -2724,6 +2736,36 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
     // If Don't_Plant is the ONLY option there is nothing to decide, so the
     // slot is not drawn (and nothing is recorded), and planting ends.
     bool type_used[NUM_COUNT_TYPES] = { false };
+
+    auto midday_land = [&]() {
+        if (midday && !d.stats.bought_land) {
+            const int extra = (int)proj.unlocked_quadrants.size() - 1;
+            if (extra < 2) {
+                const double price = LAND_PRICES[extra];
+                const double now   = std::max(0.0, spendable());
+                const int hL = (now < price) ? late_hour_for(price - now, LAND_KEY) : -1;
+                const int idx[2] = { MACRO_LAND_BASE + 0, MACRO_LAND_BASE + 1 };
+                if (hL >= 0 && draw.pick(idx, 2, H_LAND) == 1) {
+                    budget -= now;                       // kept aside until hL
+                    late_spent[hL] += price - now;
+                    d.stats.spent += price;
+                    ++slot_used[hL];
+                    late_buys.push_back({ hL, LAND_KEY });
+                    land_q = LAND_ORDER[extra];
+                    for (int y = 0; y < BOARD_SIZE; ++y)
+                        for (int x = 0; x < BOARD_SIZE; ++x)
+                            if (quadrant_of(x, y) == land_q) proj.board[y][x].bought = 1;
+                    proj.unlocked_quadrants.push_back(land_q);
+                    d.planner.widen((int)proj.unlocked_quadrants.size());
+                    land_rel = hL + 1;
+                    d.stats.bought_land = true;
+                    d.stats.bought_land_mid = true;
+                }
+            }
+        }
+
+    };
+    midday_land();
 
     // ---- DAY 0: the forced opening (MACRO_DAY0_FORCED) -------------------
     // Not a decision: nothing is drawn or recorded. 3 sheep, then 2 cows,
@@ -3090,7 +3132,7 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             }
         }
     }
-    if (d.stats.bought_land) orders.push_back(order_buy_land());
+    if (d.stats.bought_land && !d.stats.bought_land_mid) orders.push_back(order_buy_land());
     for (int c = 0; c < NUM_CROPS; ++c) {
         if (seed_done[c]) continue;
         const int want = seed_need[c] - live.seeds[c];
@@ -3147,12 +3189,14 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
     // buy is quoted (the referee walks each player's entries in order). One
     // entry per (hour, item), carrying the count.
     {
-        int n[TURNS_PER_DAY][NUM_ITEMS] = {};
+        int n[TURNS_PER_DAY][NUM_ITEMS + 1] = {};
         for (const LateBuy& lb : late_buys) ++n[lb.hour][lb.item];
         for (int h = 0; h < TURNS_PER_DAY; ++h) {
-            for (int it = 0; it < NUM_ITEMS; ++it) {
+            for (int it = 0; it <= NUM_ITEMS; ++it) {
                 if (n[h][it] <= 0) continue;
-                if (it < NUM_CROPS)
+                if (it == NUM_ITEMS)                  // the midday land
+                    d.timed_orders[h].push_back(order_buy_land());
+                else if (it < NUM_CROPS)
                     d.timed_orders[h].push_back(order_buy_seed(it, n[h][it]));
                 else
                     d.timed_orders[h].push_back(order_buy_animal(it - GOOSE, n[h][it]));

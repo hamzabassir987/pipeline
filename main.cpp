@@ -899,7 +899,7 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
     // MIDDAY PLANNING, summed over the early days for p0 (the last-day stats
     // above would always read zero for it).
     double mid_late = 0.0, mid_sold = 0.0, mid_coll = 0.0;
-    long   mid_overflow = 0;
+    long   mid_overflow = 0, mid_land = 0;
 
     for (int dy = 0; dy < NUM_DAYS; ++dy) {
         if (dy < MACRO_DECISION_DAYS) {
@@ -932,6 +932,7 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
                     mid_sold     += plan0[i].stats.mid_sold_units;
                     mid_coll     += plan0[i].stats.mid_collect_sold;
                     mid_overflow += plan0[i].stats.mid_slot_overflow;
+                    mid_land     += plan0[i].stats.bought_land_mid;
                 }
         } else {
             #pragma omp parallel for schedule(guided, 12)
@@ -1027,6 +1028,7 @@ static float eval_vs(NetPolicy& live, NetPolicy& frozen, int G, int index,
               << "    midday (d0-" << MIDDAY_LAST_DAY << ")   units sold mid-day "
               << (mid_sold / G) << "   of them collects " << (mid_coll / G)
               << "   units planted on mid-day money " << (mid_late / G)
+              << "   land bought mid-day " << mid_land
               << "   slot overflows " << mid_overflow << " (should be 0)\n"
               << "    liquidation     crew " << (liq_crew / G)
               << "   cells " << (liq_cells / G)
