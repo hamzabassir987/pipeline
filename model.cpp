@@ -3278,20 +3278,11 @@ torch::Tensor policy_to_jointlog(
 
     auto chosen_log_probs = log_softmax.index_select(0, chosen_move_indices);
 
-    // NORMALISED ENTROPY: H / log(n), n = the set's candidate count. Masking
-    // gives the same head sets of very different sizes (a type slot with 9
-    // options vs 2, a count with 14 bins vs 2), and raw entropy tops out at
-    // log(n), so without this the big sets dominate a head's mean and its
-    // entropy target means something different every day. Every recorded set
-    // has n >= 2 (a one-option set is never recorded), so log(n) > 0; the
-    // clamp only guards against a malformed batch.
+    // RAW ENTROPY per set, in nats: not divided by log(n), so a set with more
+    // candidates can carry more entropy than a small one.
     auto entropy_per_entry = -softmax * log_softmax;
     entropy = torch::zeros({num_groups}, entropy_per_entry.options());
     entropy.scatter_add_(0, valid_action_indices, entropy_per_entry);
-    auto set_size = torch::zeros({num_groups}, entropy_per_entry.options())
-                        .scatter_add_(0, valid_action_indices,
-                                      torch::ones_like(entropy_per_entry));
-    entropy = entropy / torch::log(set_size.clamp_min(2.0f));
 
     return chosen_log_probs;
 }
