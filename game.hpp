@@ -525,6 +525,15 @@ struct cell_goal {
     // when the task actually contains an A_HARVEST; see MacroPlanner.
     int sell_hour = -1;
 
+    // MID-DAY FUNDING (see MIDDAY PLANNING). A cell whose new occupant is paid
+    // for with money that only arrives mid-day: its seed or animal is BOUGHT
+    // by a timed order at hour release_hour - 1, so no op of the task may run
+    // before release_hour. With late_occupant set on an animal, the animal is
+    // not in the morning pickup either: the hand fetches it from the shed on
+    // the way, at or after release_hour. -1 / 0 is the ordinary hour-0 plan.
+    int release_hour = -1;
+    int late_occupant = 0;
+
     // Set the moment the filter accepts anything for this cell. A cell with
     // this clear was never asked for anything and build_task refuses it, which
     // is what keeps "leave it exactly as it is" free.
@@ -1587,6 +1596,34 @@ constexpr bool MACRO_FORCE_WATER_ON_PLANT = true;
 // above this reserve -- except on the last day, when feed is worthless and
 // the whole stack is offered.
 constexpr int MACRO_WHEAT_RESERVE = 0;
+
+// ---------------------------------------------------------------------------
+// MIDDAY PLANNING  --  spend today's mid-day sales today (days 0..10)
+// ---------------------------------------------------------------------------
+// The day is still decided once, at hour 0, by the same heads. What changes is
+// the planner: on an early day the money a mid-day sale brings in is spent
+// THE SAME DAY instead of the next morning.
+//
+//   INCOME     every HB_SELL harvest is routed as a sale at once (not deferred
+//              to the leftover hours), and an accepted collect is SOLD mid-day
+//              at the earliest sell hour a hand can make. Each sale adds its
+//              proceeds to an hourly income line, priced by walking the market
+//              from the morning's inventory and cut by MIDDAY_INCOME_HAIRCUT
+//              (the opponent sells into the same market in lockstep).
+//   SPENDING   once the hour-0 money cannot fund another unit, the planting
+//              pass may still place it with LATE money: its seed or animal is
+//              bought by a timed order at the earliest hour whose income (net
+//              of earlier late buys) covers it, and the unit's task is released
+//              one hour later. A crop's hand waits on the cell; an animal's
+//              hand fetches it from the shed on the way (a mid-route pickup).
+//   ORDERS     every timed entry is counted per hour, sells ahead of buys, and
+//              a late buy only goes to an hour with a free market slot.
+//
+// Land and hires stay on hour-0 money: a hire must exist before its route, and
+// land bought mid-day would have the hands cross unowned ground before it.
+constexpr int    MIDDAY_LAST_DAY       = 10;
+constexpr double MIDDAY_INCOME_HAIRCUT = 0.8;
+inline bool midday_planning(int day) { return day <= MIDDAY_LAST_DAY; }
 
 // ---- HEADS ----------------------------------------------------------------
 // Every choice set is tagged with the head that produced it, so entropy can be

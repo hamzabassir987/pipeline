@@ -737,6 +737,14 @@ int multinomial(std::vector<policy_move>& policyy) {
 //                    among them, KEEP, and (when nothing was built on the
 //                    harvest since) NO_HARVEST.
 //
+// MIDDAY PLANNING (days 0..MIDDAY_LAST_DAY, see game.hpp). The same passes,
+// three differences: a drawn Sell harvest is routed at once instead of in
+// pass 10; the collect pass runs before planting and sells each accepted
+// collect at the earliest hour a hand can make; and the planting pass, once
+// the hour-0 money is spent, places units on LATE money -- bought by a timed
+// order when the income line covers them, the task released the hour after
+// (a crop waits on its cell, an animal is fetched from the shed mid-route).
+//
 // THERE IS NO HIRE HEAD. The day starts with the crew it has (hand 0 alone:
 // nobody else survives the night) and every pass above hires, one hand at a
 // time, when what it drew does not fit the routes -- up to the crew cap
@@ -806,7 +814,8 @@ bool goal_same(const cell_goal& a, const cell_goal& b) {
         && a.want_collect_fertilizer == b.want_collect_fertilizer
         && a.want_harvest == b.want_harvest && a.want_pre_water == b.want_pre_water
         && a.want_pre_harvest == b.want_pre_harvest && a.replant == b.replant
-        && a.sell_hour == b.sell_hour && a.in_denominator == b.in_denominator;
+        && a.sell_hour == b.sell_hour && a.in_denominator == b.in_denominator
+        && a.release_hour == b.release_hour && a.late_occupant == b.late_occupant;
 }
 
 int macro_fib(int n) {   // fib(0)=1, fib(1)=1, fib(2)=2, ...  as in do_hire
@@ -1180,6 +1189,45 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         if (seed_need[c] < live.seeds[c]) return true;
         return spendable() >= (double)CROPS[c].seed_cost;
     };
+
+    // =====================================================================
+    // MIDDAY PLANNING  --  the income line (see MIDDAY PLANNING in game.hpp)
+    // =====================================================================
+    // mid_income[h]   what the mid-day sells routed so far bring in AT hour h,
+    //                 walked down the market from the morning's inventory and
+    //                 cut by MIDDAY_INCOME_HAIRCUT
+    // late_spent[h]   what the late buys routed so far spend at hour h
+    // slot_used[h]    timed market entries at hour h (one per product sold,
+    //                 one per item bought), so no hour passes the referee's
+    //                 MAX_MARKET_ORDERS_PER_TURN
+    const bool midday = midday_planning(day) && !last_day;
+    double mid_income[TURNS_PER_DAY] = {};
+    double late_spent[TURNS_PER_DAY] = {};
+    int    slot_used[TURNS_PER_DAY]  = {};
+    bool   slot_sell[TURNS_PER_DAY][NUM_PRODUCTS] = {};
+    int    mid_units_priced[NUM_PRODUCTS] = {};
+    struct LateBuy { int hour; int item; };      // item: a crop id, or an animal ITEM id
+    std::vector<LateBuy> late_buys;
+    auto note_sale = [&](int k, int units, int hour) {
+        if (!midday || k < 0 || k >= NUM_PRODUCTS || units <= 0) return;
+        if (hour < 0 || hour >= TURNS_PER_DAY) return;
+        const int inv = game.market.inventory[k] + sold[k] + mid_units_priced[k];
+        mid_income[hour] += MIDDAY_INCOME_HAIRCUT * sell_proceeds(k, units, inv);
+        mid_units_priced[k] += units;
+        d.stats.mid_sold_units += units;
+        if (!slot_sell[hour][k]) { slot_sell[hour][k] = true; ++slot_used[hour]; }
+    };
+    // Money on the income line still free at hour h and at every hour after
+    // it: a buy at h may only spend what no later buy is already counting on.
+    auto late_free_from = [&](int h) -> double {
+        double cum = 0.0, best = 1e18;
+        for (int j = 0; j < TURNS_PER_DAY; ++j) {
+            cum += mid_income[j] - late_spent[j];
+            if (j >= h) best = std::min(best, cum);
+        }
+        return std::max(0.0, best);
+    };
+
     // Seeds never touch the shed, so neither counter moves here.
     auto secure_seed = [&](int c) {
         if (seed_need[c] >= live.seeds[c]) {
@@ -1931,6 +1979,7 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             mid_units += hc.units;
             --d.stats.harvest_keep;
             ++d.stats.harvest_sell;
+            note_sale(tile_product(lt), hc.units, MACRO_FORCED_SELL_HOUR);
             return;
         }
 
@@ -1943,6 +1992,20 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             const MacroDraw::Mark st = draw.mark();
             const SellPick sp = draw_sell(cell, tb, nb, /*no=*/false, /*keep=*/true);
             if (sp.kind != SK_HOUR) { ++d.stats.sell_keep; return; }
+            // MIDDAY PLANNING: route the sale NOW, so its money is on the
+            // income line before the planting pass spends it.
+            if (midday) {
+                cell_goal now = g[cell];
+                now.sell_hour = sp.hour;
+                if (commit_hiring(cell, now, 0.0, d.stats.harvest_hires)) {
+                    night -= hc.units;
+                    mid_units += hc.units;
+                    --d.stats.harvest_keep;
+                    ++d.stats.harvest_sell;
+                    note_sale(tile_product(lt), hc.units, sp.hour);
+                    return;
+                }
+            }
             // Already routed as Keep; the drop waits for leftover hours.
             PendingSell ps;
             ps.cell = cell; ps.hour = sp.hour; ps.units = hc.units; ps.forced = true;
@@ -1958,22 +2021,25 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         // the most valuable forced harvests are switched first.)
         const SellPick sp = draw_sell(cell, tb, nb, false, false);
         bool routed = false;
+        int  hour_sold = -1;
         if (sp.kind == SK_HOUR) {
             trial.sell_hour = sp.hour;
             routed = commit_hiring(cell, trial, 0.0, d.stats.harvest_hires);
+            if (routed) hour_sold = sp.hour;
         }
         if (!routed) {
             draw.rollback(mk);
             bool rec = false;
             const SellPick rp = redraw_sale(cell, trial, true, false, false, rec);
             routed = rp.kind == SK_HOUR;
-            if (routed) ++d.stats.sell_redrawn;
+            if (routed) { ++d.stats.sell_redrawn; hour_sold = rp.hour; }
         }
         if (!routed) { ++d.stats.sell_fallback; return; }     // stays HB_KEEP
         night -= hc.units;
         mid_units += hc.units;
         --d.stats.harvest_keep;
         ++d.stats.harvest_sell;
+        note_sale(tile_product(lt), hc.units, hour_sold);
     };
 
     // ---- an OPTIONAL harvest: [None, Keep, Sell] -------------------------
@@ -2051,7 +2117,36 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             if (sp.kind == SK_NO_HARVEST) { ++d.stats.sell_skip; return false; }
             if (sp.kind == SK_KEEP) {
                 ++d.stats.sell_keep;                          // routed below as HB_KEEP
+            } else if (keep_ok && !midday) {
+                deferred_hour = sp.hour;                      // HB_KEEP now, a drop in pass 10
             } else if (keep_ok) {
+                // MIDDAY PLANNING: route the sale NOW, so its money is on the
+                // income line before the planting pass spends it. If it does
+                // not fit, it falls back to the deferred drop of pass 10.
+                const int prod = tile_product(pt);
+                cell_goal trial = sell_trial;
+                trial.sell_hour = sp.hour;
+                int units = base_units + (sell_pre ? pre_bonus : 0);
+                bool ok = commit(cell, trial);
+                if (!ok && sell_pre) {
+                    trial.want_pre_water = 0;
+                    units = base_units;
+                    ok = commit(cell, trial);
+                }
+                if (!ok) ok = commit_hiring(cell, trial, 0.0, d.stats.harvest_hires);
+                if (ok) {
+                    if (trial.want_pre_water && !had_water) {
+                        ++d.stats.must_ops;
+                        ++d.stats.must_placed;
+                    }
+                    mid_units += units;
+                    ++d.stats.harvest_sell;
+                    note_sale(prod, units, sp.hour);
+                    if (in_place) pt.yield_units = 0;
+                    else          pt = tile{ T_EMPTY, 1 };
+                    tmr_dirty = true;
+                    return true;
+                }
                 deferred_hour = sp.hour;                      // HB_KEEP now, a drop in pass 10
             } else {
                 // Cannot be kept (the night is full): route the sale now.
@@ -2102,6 +2197,7 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
                 }
                 mid_units += units;
                 ++d.stats.harvest_sell;
+                note_sale(tile_product(pt), units, trial.sell_hour);
                 if (in_place) pt.yield_units = 0;
                 else          pt = tile{ T_EMPTY, 1 };
                 tmr_dirty = true;
@@ -2184,6 +2280,66 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
     }
 
     // =====================================================================
+    // 9c. COLLECT  (drawn)  --  [No_Collect, Collect]
+    // =====================================================================
+    // Every animal with fertilizer waiting draws the collect pair. The unit is
+    // kept for the nightly sweep, so it needs a night slot. Accepting one hires
+    // to fit, like every drawn op. Run after the feed pass -- except on a
+    // MIDDAY-PLANNING day, where it runs BEFORE planting and an accepted
+    // collect is SOLD mid-day at the earliest sell hour a hand can make, so
+    // its money is on the income line when the planting pass spends it. A
+    // sale needs no night slot, only a mid-day one; if no hour routes, the
+    // collect is kept as usual.
+    auto collect_pass = [&]() {
+        for (int cell = 0; cell < CELLS; ++cell) {
+            tile& pt = proj.board[cell / BOARD_SIZE][cell % BOARD_SIZE];
+            if (!must_collect(pt))              continue;
+            if (!goal_is_animal(g[cell]))       { ++d.stats.rej_illegal; continue; }
+            const bool can_sell = midday && room - mid_units >= 1 &&
+                                  !g[cell].want_harvest && g[cell].sell_hour < 0 &&
+                                  !g[cell].want_pre_harvest;
+            if (night >= SHED_CAPACITY && !can_sell) { ++d.stats.rej_budget; continue; }
+            if (draw.binary(MACRO_COLLECT_BASE, cell, H_COLLECT) != 1) continue;
+            cell_goal trial = g[cell];
+            trial.in_denominator = 1;
+            trial.want_collect_fertilizer = 1;
+
+            if (can_sell) {
+                MacroPlanner::Task tk;
+                cell_goal priced = trial;
+                priced.sell_hour = TURNS_PER_DAY - 1;
+                const int lo = task_for(cell, priced, tk) ? d.planner.min_drop_hour(cell, tk)
+                                                          : TURNS_PER_DAY;
+                bool sold_it = false;
+                for (int b = 0; b < MACRO_SELL_HOUR_BINS && !sold_it; ++b) {
+                    const int h = MACRO_SELL_HOURS[b];
+                    if (h < lo) continue;
+                    cell_goal st = trial;
+                    st.sell_hour = h;
+                    if (!commit_moving(cell, st)) continue;
+                    pt.fertilizer_available = 0;
+                    mid_units += 1;
+                    note_sale(FERTILIZER, 1, h);
+                    ++d.stats.collected;
+                    ++d.stats.mid_collect_sold;
+                    sold_it = true;
+                }
+                if (sold_it) continue;
+                if (night >= SHED_CAPACITY) { draw.retract(); ++d.stats.rej_capacity; continue; }
+            }
+
+            if (!commit_hiring(cell, trial, 0.0, d.stats.collect_hires)) {
+                draw.retract(); ++d.stats.rej_capacity; continue;
+            }
+            pt.fertilizer_available = 0;
+            ++night;
+            collect_cells.push_back(cell);
+            ++d.stats.collected;
+        }
+    };
+    if (midday) collect_pass();
+
+    // =====================================================================
     // 8. PLANTING  --  a count per type, placed by distance to the shed
     // =====================================================================
     // HARVEST, DIG, PLANT. A doomed ONGOING crop (it rots from tomorrow) whose
@@ -2252,18 +2408,55 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         return (item_need[it] < kept[it]) ? 0.0 : unit_price(it);
     };
 
+    // ---- MIDDAY PLANNING: a unit paid for with LATE money ----------------
+    // The earliest hour a late buy of `cost` can go out: the income line, net
+    // of the late buys already placed, covers it from that hour on; the hour
+    // has a free market slot (with room kept for every pass-10 drop still to
+    // come, which may land on any hour); and the unit it releases (one hour
+    // later) still has the day left to be planted. -1 if there is none.
+    // `key` names the market entry: a crop id for a seed, an ITEM id for an
+    // animal (the two ranges do not overlap).
+    const int pend_reserve = (int)pending_sells.size();
+    auto late_hour_for = [&](double cost, int key) -> int {
+        if (!midday) return -1;
+        for (int h = d.n_order_hours; h < TURNS_PER_DAY - 2; ++h) {
+            bool have = false;
+            for (const LateBuy& lb : late_buys) if (lb.hour == h && lb.item == key) have = true;
+            if (slot_used[h] + (have ? 0 : 1) + pend_reserve > MAX_MARKET_ORDERS_PER_TURN) continue;
+            if (late_free_from(h) + 1e-9 < cost) continue;
+            return h;
+        }
+        return -1;
+    };
+    // How many more units of type k late money could fund at most (the money
+    // free at the last useful hour; slots and hours are checked per unit).
+    auto late_units_for = [&](int k) -> int {
+        if (!midday) return 0;
+        const double avail = late_free_from(TURNS_PER_DAY - 3);
+        const double per = (k < NUM_CROPS) ? (double)CROPS[k].seed_cost
+                                           : (double)ANIMALS[k - NUM_CROPS].cost;
+        int n = (int)std::floor(avail / per);
+        if (k >= NUM_CROPS) n = std::min(n, std::max(0, room - mid_units));
+        return std::max(0, n);
+    };
+
     // ---- PLACE ONE UNIT of `type` on `cell` -------------------------------
     // Forced: if the routes cannot absorb it, hire until they can (within the
     // spendable money and the crew cap). False if nothing makes it fit; the
     // cell is then left as it was.
-    auto place_one = [&](int cell, int type) -> bool {
+    // late_hour >= 0: the unit is paid for with LATE money -- bought by a
+    // timed order at that hour, its task released the hour after.
+    auto place_one = [&](int cell, int type, int late_hour) -> bool {
         const int y = cell / BOARD_SIZE, x = cell % BOARD_SIZE;
         tile& pt = proj.board[y][x];
         const int crop = (type < NUM_CROPS) ? type : -1;
         const int anim = (type < NUM_CROPS) ? -1 : type - NUM_CROPS;
+        const bool late = late_hour >= 0;
 
         cell_goal trial = g[cell];
         trial.in_denominator = 1;
+        trial.release_hour  = late ? late_hour + 1 : -1;
+        trial.late_occupant = (late && anim >= 0) ? 1 : 0;
         // HARVEST, DIG, PLANT: the standing units are banked BEFORE the dig.
         // Left as want_harvest the op would be ordered after the new occupant
         // and land on an empty plant or a fresh animal.
@@ -2290,12 +2483,28 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             trial.want_watered = trial.want_fertilized = 0;
         }
 
-        // Forced: the crew grows (up to the hard cap) until the unit fits.
-        if (!commit_hiring(cell, trial, occupant_cost(crop, anim),
+        // Forced: the crew grows (up to the hard cap) until the unit fits. A
+        // late unit's price is not hour-0 money, so it keeps none in hand.
+        if (!commit_hiring(cell, trial, late ? 0.0 : occupant_cost(crop, anim),
                            d.stats.plant_hires)) return false;
 
+        if (late) {
+            const int key = crop >= 0 ? crop : animal_item(anim);
+            const double cost = crop >= 0 ? (double)CROPS[crop].seed_cost
+                                          : (double)ANIMALS[anim].cost;
+            bool have = false;
+            for (const LateBuy& lb : late_buys)
+                if (lb.hour == late_hour && lb.item == key) have = true;
+            if (!have) ++slot_used[late_hour];
+            late_buys.push_back({ late_hour, key });
+            late_spent[late_hour] += cost;
+            d.stats.spent += cost;
+            if (anim >= 0) --room;           // in the shed until the hand fetches it
+            ++d.stats.late_units;
+        }
+
         if (crop >= 0) {
-            secure_seed(crop);
+            if (!late) secure_seed(crop);
             pt = tile{};
             pt.type   = T_PLANT;
             pt.bought = 1;
@@ -2311,7 +2520,7 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
                 ++d.stats.must_placed;
             }
         } else {
-            secure(animal_item(anim));
+            if (!late) secure(animal_item(anim));
             pt = tile{};
             pt.type   = ANIMALS[anim].structure;
             pt.bought = 1;
@@ -2429,7 +2638,7 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             const double avail = spendable();
             const int buy = avail > 0.0
                 ? (int)std::floor(avail / (double)CROPS[k].seed_cost) : 0;
-            fundable = on_hand + buy;
+            fundable = on_hand + buy + late_units_for(k);
         } else {
             const int item = animal_item(k - NUM_CROPS);
             const int on_hand = std::max(0, kept[item] - item_need[item]);
@@ -2440,7 +2649,7 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             // BUY room, not the harvest limit: commit_unit refuses an
             // A_BUY_ANIMAL on a full shed.
             buy = std::min(buy, std::max(0, room - mid_units));
-            fundable = on_hand + buy;
+            fundable = on_hand + buy + late_units_for(k);
         }
 
         const int type_max = is_crop ? MACRO_PLANT_MAX : MACRO_PLACE_MAX;
@@ -2459,13 +2668,24 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
 
     // Put down up to `want` units of type k, in the type's placement order.
     auto place_type = [&](int k, int want, const std::vector<Cand>& cands) {
+        // Hour-0 money first; once it runs out, LATE money (midday planning).
+        auto late_hour_now = [&]() -> int {
+            if (type_affordable_now(k)) return -1;
+            if (k < NUM_CROPS) return late_hour_for((double)CROPS[k].seed_cost, k);
+            if (room - mid_units < 1) return -2;
+            return late_hour_for((double)ANIMALS[k - NUM_CROPS].cost,
+                                 animal_item(k - NUM_CROPS));
+        };
         if (k < NUM_CROPS) {
             for (const Cand& c : cands) {
                 if (want <= 0) break;
-                if (!type_affordable_now(k)) { ++d.stats.rej_budget; break; }
+                const int lh = late_hour_now();
+                if (lh < -1 || (lh == -1 && !type_affordable_now(k))) {
+                    ++d.stats.rej_budget; break;
+                }
                 if (!cell_open(c.cell)) continue;
-                if (place_one(c.cell, k)) --want;
-                else                      ++d.stats.rej_capacity;
+                if (place_one(c.cell, k, lh)) --want;
+                else                          ++d.stats.rej_capacity;
             }
             return;
         }
@@ -2476,7 +2696,10 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         // failed to fit is not retried.
         bool tried[CELLS] = { false };
         while (want > 0) {
-            if (!type_affordable_now(k)) { ++d.stats.rej_budget; break; }
+            const int lh = late_hour_now();
+            if (lh < -1 || (lh == -1 && !type_affordable_now(k))) {
+                ++d.stats.rej_budget; break;
+            }
             const Cand* best = nullptr;
             for (int tier = 0; tier < 2 && !best; ++tier) {
                 for (const Cand& c : cands) {
@@ -2490,7 +2713,7 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
             }
             if (!best) break;
             tried[best->cell] = true;
-            if (place_one(best->cell, k)) --want;
+            if (place_one(best->cell, k, lh)) --want;
             else                          ++d.stats.rej_capacity;
         }
     };
@@ -2733,30 +2956,9 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         tmr_dirty = true;
     }
 
-    // =====================================================================
-    // 9c. COLLECT  (drawn)  --  [No_Collect, Collect]
-    // =====================================================================
-    // Every animal with fertilizer waiting draws the collect pair, once the
-    // harvests, plantings and feeds have taken the hours and the shed. The
-    // unit is kept for the nightly sweep, so it needs a night slot: a full
-    // night is not offered. Accepting one hires to fit, like every drawn op.
-    for (int cell = 0; cell < CELLS; ++cell) {
-        tile& pt = proj.board[cell / BOARD_SIZE][cell % BOARD_SIZE];
-        if (!must_collect(pt))              continue;
-        if (!goal_is_animal(g[cell]))       { ++d.stats.rej_illegal; continue; }
-        if (night >= SHED_CAPACITY)         { ++d.stats.rej_budget;  continue; }
-        if (draw.binary(MACRO_COLLECT_BASE, cell, H_COLLECT) != 1) continue;
-        cell_goal trial = g[cell];
-        trial.in_denominator = 1;
-        trial.want_collect_fertilizer = 1;
-        if (!commit_hiring(cell, trial, 0.0, d.stats.collect_hires)) {
-            draw.retract(); ++d.stats.rej_capacity; continue;
-        }
-        pt.fertilizer_available = 0;
-        ++night;
-        collect_cells.push_back(cell);
-        ++d.stats.collected;
-    }
+    // 9c. COLLECT: see collect_pass above (run here, or before planting on
+    // a midday-planning day).
+    if (!midday) collect_pass();
 
     // =====================================================================
     // 10. PENDING SALES  --  the mid-day drops, in whatever hours are left
@@ -2779,6 +2981,8 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
     auto sold_mid = [&](const PendingSell& ps) {
         night     -= ps.units;
         mid_units += ps.units;
+        note_sale(tile_product(live.board[ps.cell / BOARD_SIZE][ps.cell % BOARD_SIZE]),
+                  ps.units, ps.hour);
         --d.stats.harvest_keep;
         ++d.stats.harvest_sell;
     };
@@ -2936,6 +3140,27 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
                     d.timed_orders[h].push_back(order_sell(k, per[h][k]));
                     d.stats.sell_units += per[h][k];
                 }
+    }
+
+    // ---- THE LATE BUYS (midday planning) --------------------------------
+    // After the hour's sells, so the money they bring in is there when the
+    // buy is quoted (the referee walks each player's entries in order). One
+    // entry per (hour, item), carrying the count.
+    {
+        int n[TURNS_PER_DAY][NUM_ITEMS] = {};
+        for (const LateBuy& lb : late_buys) ++n[lb.hour][lb.item];
+        for (int h = 0; h < TURNS_PER_DAY; ++h) {
+            for (int it = 0; it < NUM_ITEMS; ++it) {
+                if (n[h][it] <= 0) continue;
+                if (it < NUM_CROPS)
+                    d.timed_orders[h].push_back(order_buy_seed(it, n[h][it]));
+                else
+                    d.timed_orders[h].push_back(order_buy_animal(it - GOOSE, n[h][it]));
+            }
+            // Should never fire: every late buy was given a free slot.
+            if ((int)d.timed_orders[h].size() > MAX_MARKET_ORDERS_PER_TURN)
+                ++d.stats.mid_slot_overflow;
+        }
     }
     d.stats.busy_hands = d.planner.busy_hands();
     d.stats.night_ledger = night;

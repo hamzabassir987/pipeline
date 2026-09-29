@@ -208,6 +208,14 @@ public:
         // harvest, a collected fertilizer). Rules out the one-hour drop-all.
         bool carries_other = false;
 
+        // ---- MIDDAY PLANNING -------------------------------------------
+        // No op of this task may run before release_hour (its seed or animal
+        // is bought by a timed order the hour before). late_item >= 0: that
+        // item is NOT in the morning pickup; the hand fetches it from the shed
+        // on the way to the cell, at or after release_hour.
+        int release_hour = -1;
+        int late_item    = -1;
+
         bool sells() const { return sell_hour >= 0 && h_op >= 0 && h_product >= 0; }
     };
 
@@ -234,6 +242,13 @@ public:
         out.animal_item_id = goal_is_animal(g) ? animal_item(g.target_animal) : -1;
         out.h_op = -1; out.h_product = -1; out.h_units0 = 0; out.h_bonus = 0;
         out.h_max = 0; out.h_mls = -1; out.sell_hour = -1; out.carries_other = false;
+        out.release_hour = g.release_hour;
+        out.late_item = -1;
+        // A LATE animal is fetched mid-route, so it is not a morning pickup.
+        auto add_animal = [&](int item) {
+            if (g.late_occupant) out.late_item = item;
+            else                 out.items.push_back(item);
+        };
 
         // Every A_HARVEST a task can hold acts on the HOUR-0 contents of the
         // cell (the pre-harvest, the ripe clearing harvest, the in-place
@@ -274,7 +289,7 @@ public:
         if (!gate) {
             if (goal_is_animal(g) && t.type == g.target_type && t.animal == -1) {
                 out.ops.push_back(A_PLACE);
-                out.items.push_back(animal_item(g.target_animal));
+                add_animal(animal_item(g.target_animal));
             } else if (t.animal >= 0) {
                 return false;   // a live animal cannot be evicted inside a day
             } else {
@@ -292,7 +307,7 @@ public:
                                                               : A_BUILD_PASTURE);
                     if (g.target_animal >= 0) {
                         out.ops.push_back(A_PLACE);
-                        out.items.push_back(animal_item(g.target_animal));
+                        add_animal(animal_item(g.target_animal));
                     }
                 }
             }
@@ -304,19 +319,31 @@ public:
                 && !goal_bool_satisfied(b, t, day);
         };
         bool collects = false;
+        int  collect_op = -1;
         if (asked(GB_HARVEST) && out.h_op < 0) push_harvest();
         if (asked(GB_FERTILIZED)){ out.ops.push_back(A_FERTILIZE); out.items.push_back(FERTILIZER); }
         if (asked(GB_WATERED))     out.ops.push_back(A_WATER);
-        if (asked(GB_COLLECT))   { out.ops.push_back(A_COLLECT_FERTILIZER); collects = true; }
+        if (asked(GB_COLLECT))   { collect_op = (int)out.ops.size();
+                                   out.ops.push_back(A_COLLECT_FERTILIZER); collects = true; }
         if (asked(GB_FED))       { out.ops.push_back(A_FEED);      out.items.push_back(WHEAT); }
         if (asked(GB_CARED))       out.ops.push_back(A_CARE);
 
         if (out.ops.empty()) return false;
 
+        // A SOLD COLLECT (midday planning): with no harvest on the cell, the
+        // collected fertilizer is the task's sale -- one unit, no decay.
+        bool collect_sold = false;
+        if (out.h_op < 0 && collect_op >= 0 &&
+            g.sell_hour >= 0 && g.sell_hour < TURNS_PER_DAY) {
+            out.h_op = collect_op;
+            out.h_product = FERTILIZER;
+            out.h_units0 = 1; out.h_max = 1; out.h_mls = -1; out.h_bonus = 0;
+            collect_sold = true;
+        }
         if (out.h_op >= 0 && out.h_product >= 0 && out.h_product < NUM_PRODUCTS &&
             g.sell_hour >= 0 && g.sell_hour < TURNS_PER_DAY)
             out.sell_hour = g.sell_hour;
-        out.carries_other = collects || (out.h_op >= 0 && out.sell_hour < 0);
+        out.carries_other = (collects && !collect_sold) || (out.h_op >= 0 && out.sell_hour < 0);
 
         const int open = (int)out.ops.size() - out.type_ops;
         out.value = out.n_asked ? (double)open / (double)out.n_asked : 1.0;
@@ -617,6 +644,8 @@ private:
         bool     vs    = false;    // T.sells()
         bool     co    = false;    // T.carries_other
         bool     items = false;    // !T.items.empty()
+        int      rel   = -1;       // T.release_hour
+        int      late  = -1;       // T.late_item
     };
     std::vector<TInfo> ti_;        // per cell, parallel to task_
     // geo_->dist, read directly in the hot loops. The geometries are static
@@ -633,6 +662,8 @@ private:
         I.vbit  = I.vs ? (1u << T.h_product) : 0u;
         I.co    = T.carries_other;
         I.items = !T.items.empty();
+        I.rel   = T.release_hour;
+        I.late  = T.late_item;
         I.imask = 0;
         for (const int it : T.items) I.imask |= (1u << it);
     }
@@ -651,6 +682,40 @@ private:
     static int drop_cost_of(unsigned mask, bool dirty) {
         return dirty ? __builtin_popcount(mask) : 1;
     }
+
+    // ---- WHEN A TASK'S OPS CAN START (midday planning) -------------------
+    // The hand stands on `cur` with `t` steps used; step k runs at hour
+    // base + k. Returns the step the task's first op runs at (INF if it cannot
+    // be reached) and the path there:
+    //   no release, no late item   walk straight in: t + D(cur, v)
+    //   release only (a crop)      walk in, then wait on the cell (w2 PASSes)
+    //                              until release_hour
+    //   late item (an animal)      walk to a shed tile, wait there (w1) until
+    //                              release_hour, A_PICKUP it (one step), walk
+    //                              on to v. The shed tile is the one that
+    //                              starts the ops soonest.
+    // run() and ws_step() both call this, so pricing and emitting agree.
+    struct Arrive { int t_ops = INF, acc = -1, w1 = 0, w2 = 0; };
+    Arrive arrive(int t, int cur, int v, int rel_hour, int late, int base) const {
+        Arrive a;
+        const int rel = (rel_hour >= 0) ? rel_hour - base : -INF;
+        if (late < 0) {
+            const int d = DD(cur, v);
+            if (d >= INF) return a;
+            const int at = t + d;
+            a.w2 = std::max(0, rel - at);
+            a.t_ops = at + a.w2;
+            return a;
+        }
+        for (const int ac : access_) {
+            const int d1 = DD(cur, ac), d2 = DD(ac, v);
+            if (d1 >= INF || d2 >= INF) continue;
+            const int w1 = std::max(0, rel - (t + d1));
+            const int to = t + d1 + w1 + 1 + d2;
+            if (to < a.t_ops) { a.t_ops = to; a.acc = ac; a.w1 = w1; a.w2 = 0; }
+        }
+        return a;
+    }
     WS ws_begin(int start, unsigned imask) const {
         WS s;
         s.t = __builtin_popcount(imask);   // one pickup per distinct item
@@ -664,8 +729,9 @@ private:
     // and in_from[i + 1]. False exactly where run() returns a failed Eval.
     bool ws_step(WS& s, int v, bool in_i, bool in_n) const {
         const TInfo& T = ti_[v];
-        int d = DD(s.cur, v);
-        if (d >= INF) return false;
+        Arrive A = arrive(s.t, s.cur, v, T.rel, T.late, ss_plan_);
+        if (A.t_ops >= INF) return false;
+        int d = A.t_ops - s.t;                 // steps until the first op
 
         bool go_on = true;
         if (s.pmask | T.vbit) {
@@ -690,7 +756,9 @@ private:
             s.t += dc;
             s.pmask = 0; s.pdl = INF;
             if (s.t > budget_) return false;
-            d = DD(s.cur, v);
+            A = arrive(s.t, s.cur, v, T.rel, T.late, ss_plan_);
+            if (A.t_ops >= INF) return false;
+            d = A.t_ops - s.t;
             if (T.vs) {
                 const bool dirty2 = s.other || T.co || in_n;
                 if (s.t + d + T.ops + dshed_[v] + drop_cost_of(T.vbit, dirty2) - 1 > T.vdl)
@@ -899,8 +967,10 @@ private:
             const int vdl = vs ? dl_step(T.sell_hour) : INF;
             const unsigned vbit = vs ? (1u << T.h_product) : 0u;
 
-            int d = geo_->D(cur, v);
-            if (d >= INF) return r;
+            const int base = em ? em->start_hour : ss_plan_;
+            Arrive A = arrive(t, cur, v, T.release_hour, T.late_item, base);
+            if (A.t_ops >= INF) return r;
+            int d = A.t_ops - t;                // steps until the first op
 
             // Going on to v: can the batch, plus v's units, still make it?
             bool go_on = true;
@@ -929,7 +999,9 @@ private:
                 t += dc;
                 pmask = 0; pdl = INF;
                 if (t > budget_) return r;
-                d = geo_->D(cur, v);
+                A = arrive(t, cur, v, T.release_hour, T.late_item, base);
+                if (A.t_ops >= INF) return r;
+                d = A.t_ops - t;
                 if (vs) {
                     const bool dirty2 = other || T.carries_other || in_from[i + 1];
                     if (t + d + ops + dshed_[v] + drop_cost(vbit, dirty2) - 1 > vdl)
@@ -938,7 +1010,15 @@ private:
             }
 
             if (em) {
-                walk(cur, v);
+                if (A.acc >= 0) {                   // the late pickup, on the way
+                    walk(cur, A.acc);
+                    for (int w = 0; w < A.w1; ++w) em->s->push_back(act(em->hi, A_PASS));
+                    em->s->push_back(act_pickup(em->hi, T.late_item, 1));
+                    walk(A.acc, v);
+                } else {
+                    walk(cur, v);
+                }
+                for (int w = 0; w < A.w2; ++w) em->s->push_back(act(em->hi, A_PASS));
                 for (const int op : T.ops) {
                     if (op == A_PLANT)      em->s->push_back(act_plant(em->hi, T.crop_id));
                     else if (op == A_PLACE) em->s->push_back(act_place_item(em->hi, T.animal_item_id));
@@ -1382,6 +1462,11 @@ struct MacroStats {
     int fertilized = 0;
     int cared = 0;
     int collected = 0;       // the collect head's accepted collects
+    // ---- midday planning ----
+    int mid_sold_units = 0;   // units sold mid-day on a midday-planning day
+    int mid_collect_sold = 0; // collects sold mid-day instead of kept
+    int late_units = 0;       // plantings / placements paid with mid-day money
+    int mid_slot_overflow = 0;// hours whose timed entries passed the referee cap (must stay 0)
     int escape_harvests = 0; // animals left unfed tonight, harvested so the
                              // units are not lost with the escape
     // ---- hires, by the pass that made them (there is no hire head) ----
