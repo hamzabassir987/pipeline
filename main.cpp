@@ -107,6 +107,10 @@ constexpr size_t OBS_ELEMS = (size_t)NUM_INPUT_CH * CELLS;
 // scales the critic's own gradient.
 constexpr float VALUE_COEF = 0.5f;
 
+// The per-set advantage is clamped to +-ADV_CLIP before the policy loss. The
+// ppo log prints what share of sets the clamp changed.
+constexpr double ADV_CLIP = 6.0;
+
 // ---------------------------------------------------------------------------
 // GRADIENT-NORM CLIPPING, ONE THRESHOLD PER MODEL
 // ---------------------------------------------------------------------------
@@ -1199,6 +1203,10 @@ int main()
         "iteration", "states", "sets_per_state",
         "policy_loss", "value_loss", "entropy", "entropy_loss" };
     for (int h = 0; h < NUM_HEADS; ++h) csv_cols.push_back(std::string("e_") + HEAD_NAMES[h]);
+    // The advantage the policy loss actually sees: per choice set, AFTER the
+    // +-ADV_CLIP clamp. clip_frac is the share of sets the clamp changed.
+    for (const char* c : { "adv_mean", "adv_std", "adv_min", "adv_max", "adv_clip_frac" })
+        csv_cols.push_back(c);
     std::vector<int> csv_w;
     for (const auto& c : csv_cols) csv_w.push_back(std::max<int>(12, (int)c.size()));
     auto csv_row = [&](const std::vector<std::string>& cells) {
@@ -1456,7 +1464,8 @@ int main()
             auto mini_head_ids                  = gpu_idx.narrow(0, 3 * C + 2 * S, S);
 
             auto mini_log_prob   = gpu_flt.narrow(0, 0, S);
-            auto adv_per_action  = torch::clamp(gpu_flt.narrow(0, S, S), -6.0, 6.0);
+            auto adv_raw         = gpu_flt.narrow(0, S, S);
+            auto adv_per_action  = torch::clamp(adv_raw, -ADV_CLIP, ADV_CLIP);
             auto mini_returns    = gpu_flt.narrow(0, 2 * S, K);
             auto old_values      = gpu_flt.narrow(0, 2 * S + K, K);
             (void)old_values;
@@ -1511,10 +1520,17 @@ int main()
                                        entropy_mean.detach().reshape({1}),
                                        entropy_loss.detach().reshape({1}),
                                        head_mean.detach(),
-                                       head_cnt.detach()}, 0).to(torch::kCPU);
+                                       head_cnt.detach(),
+                                       adv_per_action.mean().reshape({1}),
+                                       adv_per_action.std(/*unbiased=*/false).reshape({1}),
+                                       adv_per_action.min().reshape({1}),
+                                       adv_per_action.max().reshape({1}),
+                                       (adv_raw.abs() > ADV_CLIP).to(torch::kFloat32)
+                                           .mean().reshape({1})}, 0).to(torch::kCPU);
                 const float* r  = row.data_ptr<float>();
                 const float* hm = r + 4;
                 const float* hc = r + 4 + NUM_HEADS;
+                const float* av = r + 4 + 2 * NUM_HEADS;   // mean std min max clip_frac
 
                 {
                     std::vector<std::string> cells = {
@@ -1525,6 +1541,7 @@ int main()
                     // cell, not 0: pandas reads it as NaN.
                     for (int h = 0; h < NUM_HEADS; ++h)
                         cells.push_back(hc[h] > 0.0f ? csv_f(hm[h]) : std::string(""));
+                    for (int j = 0; j < 5; ++j) cells.push_back(csv_f(av[j]));
                     csv_row(cells);
                 }
 
@@ -1542,6 +1559,12 @@ int main()
                   << "    value loss" << lfmt::num(r[1], 10)
                   << "    entropy bonus" << lfmt::num(r[3], 10)
                   << "    mean entropy" << lfmt::num(r[2], 8) << "\n"
+                  << "  " << lfmt::label("")
+                  << "advantage (clipped, per set)  mean" << lfmt::num(av[0], 9)
+                  << "    std" << lfmt::num(av[1], 9)
+                  << "    min" << lfmt::num(av[2], 9)
+                  << "    max" << lfmt::num(av[3], 9)
+                  << "    clipped" << lfmt::num(100.0f * av[4], 7) << "%\n"
                   << "  " << lfmt::label("")
                   << lfmt::label("head", 14) << "    entropy     coef      sets\n";
                 for (int h = 0; h < NUM_HEADS; ++h) {
