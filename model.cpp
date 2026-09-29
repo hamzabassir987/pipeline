@@ -1897,12 +1897,30 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         const int htype = tile_harvest_type(lt);
         if (htype < 0 || !g[cell].in_denominator) return;
         if (room - mid_units < hc.units) return;             // mid-day bound
+        // Wheat / carrot: no sell time. Kept while the night has room.
+        const bool timed = harvest_type_has_sell_time(htype);
+        if (!timed && night <= SHED_CAPACITY) return;
 
         cell_goal trial = g[cell];
         trial.sell_hour = TURNS_PER_DAY - 1;                  // priced as a sale
         int tb[MACRO_SELL_HOUR_BINS];
         const int nb = sell_bins_for(cell, trial, tb);
         if (nb <= 0) return;                                  // Keep is the only option
+
+        if (!timed) {
+            // The night is full: sell at the fixed hour, no draw. The bins are
+            // a suffix ending at 23, so nb > 0 means 23 is in reach.
+            trial.sell_hour = MACRO_FORCED_SELL_HOUR;
+            if (!commit_hiring(cell, trial, 0.0, d.stats.harvest_hires)) {
+                ++d.stats.sell_fallback;                      // stays HB_KEEP
+                return;
+            }
+            night -= hc.units;
+            mid_units += hc.units;
+            --d.stats.harvest_keep;
+            ++d.stats.harvest_sell;
+            return;
+        }
 
         const MacroDraw::Mark mk = draw.mark();
         if (night <= SHED_CAPACITY) {
@@ -1989,7 +2007,10 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         int tb[MACRO_SELL_HOUR_BINS];
         const int nb = (room - mid_units >= base_units)
                      ? sell_bins_for(cell, sell_trial, tb) : 0;
-        const bool sell_ok = nb > 0;
+        // Wheat / carrot: no sell time. Sell is offered only when the night
+        // cannot take the units, and then always at the fixed hour.
+        const bool timed = harvest_type_has_sell_time(htype);
+        const bool sell_ok = nb > 0 && (timed || !keep_ok);
 
         if (!keep_ok && !sell_ok) { ++d.stats.rej_budget; return false; }
 
@@ -2008,7 +2029,13 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
         MacroDraw::Mark st;
         if (bin == HB_SELL) {
             st = draw.mark();
-            const SellPick sp = draw_sell(cell, tb, nb, /*no=*/true, /*keep=*/keep_ok);
+            SellPick sp;
+            if (timed) {
+                sp = draw_sell(cell, tb, nb, /*no=*/true, /*keep=*/keep_ok);
+            } else {                                          // no draw: hour 23
+                sp.kind = SK_HOUR;
+                sp.hour = MACRO_FORCED_SELL_HOUR;
+            }
             if (sp.kind == SK_NO_HARVEST) { ++d.stats.sell_skip; return false; }
             if (sp.kind == SK_KEEP) {
                 ++d.stats.sell_keep;                          // routed below as HB_KEEP
@@ -2026,6 +2053,14 @@ static void macro_plan_day_impl(const float* out, simulation& game, int player, 
                     ok = commit(cell, trial);
                 }
                 if (!ok) ok = commit_hiring(cell, trial, 0.0, d.stats.harvest_hires);
+                if (!ok && !timed) {
+                    // Hour 23 is the loosest deadline there is, so no earlier
+                    // hour would route either: the harvest is off.
+                    draw.rollback(mk);
+                    ++d.stats.sell_fallback;
+                    ++d.stats.rej_capacity;
+                    return false;
+                }
                 if (!ok) {
                     // REMASK, without the pre-water and without KEEP (the
                     // night is full): the hours that still route, or leave it.

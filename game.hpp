@@ -1318,6 +1318,21 @@ constexpr int ST_KEEP              = MACRO_SELL_HOUR_BINS + 1;        // 13
 constexpr int MACRO_SELL_TIME_BINS = MACRO_SELL_HOUR_BINS + 2;        // 14
 constexpr int MACRO_SELL_TIME_CH   = MACRO_SELL_TIME_BINS;            // 14
 
+// WHEAT AND CARROT HAVE NO SELL TIME. Their harvests are HB_KEEP (the units
+// ride home and tomorrow's sell head sells them) and never draw HB_SELL or the
+// sell-time head. The one exception is a night the shed cannot take: then the
+// units are sold mid-day at MACRO_FORCED_SELL_HOUR, with no draw for the hour
+//   optional  the harvest head offers [HB_NONE, HB_SELL] instead of
+//             [HB_NONE, HB_KEEP], and HB_SELL means "sell at hour 23"
+//   forced    no draw at all: routed as a sale at hour 23, or kept (and
+//             overflowing) if even that does not route
+// The channels stay in the layout (the wheat / carrot HB_SELL channel and the
+// sell-time bins on their cells simply go unused), so checkpoints still load.
+constexpr int MACRO_FORCED_SELL_HOUR = TURNS_PER_DAY - 1;             // 23
+inline bool harvest_type_has_sell_time(int htype) {
+    return htype != WHEAT && htype != CARROT;
+}
+
 constexpr int MACRO_FERT_CH      = 2;    // [No_Fert, Fert]
 constexpr int MACRO_FEED_CH      = 2;    // [No_Feed, Feed]
 
