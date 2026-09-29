@@ -101,6 +101,16 @@ constexpr double   GAP_SCALE        = 1.0 / 6000000.0;
 constexpr float    GAP_CLAMP        = 0.0f;
 constexpr float    END_REWARD       = 1.0f;
 
+// MARGIN: on the last decision day, on top of END_REWARD,
+//     clamp(MARGIN_COEF * tanh((money_me - money_opp) / MARGIN_SCALE),
+//           -MARGIN_CLIP, MARGIN_CLIP)
+// on FINAL money (after the liquidation), the same quantity check_winner
+// compares. It separates a close game from a blowout, so a lost game still
+// says how badly and a won one how safely.
+constexpr double   MARGIN_SCALE     = 5000.0;
+constexpr float    MARGIN_COEF      = 0.3f;
+constexpr float    MARGIN_CLIP      = 0.5f;
+
 constexpr size_t OBS_ELEMS = (size_t)NUM_INPUT_CH * CELLS;
 
 // Weight of the value loss. The critic has its own body now, so this only
@@ -686,6 +696,11 @@ static float rollouts_macro(NetPolicy& player, simulation games[GAMES_AMOUNT],
         if (t == D - 1) {
             if (result[i] == p)          r += END_REWARD;
             else if (result[i] == 1 - p) r -= END_REWARD;
+            // MARGIN: final money, the row after the last decision day.
+            const size_t fin = (size_t)D * G + i;
+            const double margin = mo[p][fin] - mo[1 - p][fin];
+            r += std::clamp(MARGIN_COEF * (float)std::tanh(margin / MARGIN_SCALE),
+                            -MARGIN_CLIP, MARGIN_CLIP);
         }
         return r;
     };
@@ -1129,7 +1144,8 @@ int main()
     std::cout << "reward: net-worth gap / " << (int)(1.0 / GAP_SCALE)
               << " per day from day " << REWARD_START_DAY
               << ", lead +-" << LEAD_REWARD << " per day, +-" << END_REWARD
-              << " at the end" << std::endl;
+              << " at the end, margin " << MARGIN_COEF << "*tanh(d/"
+              << (int)MARGIN_SCALE << ") clipped +-" << MARGIN_CLIP << std::endl;
 
     std::vector<torch::Tensor> params;
     for (auto& np : player->named_parameters()) {
